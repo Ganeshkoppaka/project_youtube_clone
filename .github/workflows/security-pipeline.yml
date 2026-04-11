@@ -154,3 +154,5 @@ jobs:
             exit 1
           fi
           echo "✅ Build successful — $(du -sh build) created"
+
+          #test
