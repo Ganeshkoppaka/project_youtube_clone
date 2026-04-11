@@ -1,0 +1,177 @@
+name: Image Security Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+# Minimum permissions — this job needs to push to registry and sign
+permissions:
+  contents: read
+  packages: write          # push to GitHub Container Registry (GHCR)
+  id-token: write          # Cosign keyless signing via OIDC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # GHCR = GitHub Container Registry (free, built into GitHub)
+  # Image name: ghcr.io/ganeshkoppaka/project_youtube_clone
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+# ─────────────────────────────────────────────────────────────
+# JOB 1: BUILD THE IMAGE
+# Multi-stage build, inject secret as build arg
+# ─────────────────────────────────────────────────────────────
+  build-image:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+
+    outputs:
+      # Pass the image digest to later jobs for signing
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-ref: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Enables BuildKit — faster builds, better caching, secrets support
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@ffb3193908564d14b099e8f6bbacbaea94ee2ac4
+
+      # Log in to GitHub Container Registry using the auto-generated token
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN is auto-generated per-run — no static credentials
+
+      # Generate image tags and labels from git metadata
+      # e.g. ghcr.io/ganeshkoppaka/project_youtube_clone:main-abc1234
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@70b2cdc6480c1a8b86edf1777157f8f437de2166
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+          # Result tags:
+          # main
+          # main-abc1234  ← the SHA tag, immutable, never :latest
+
+      # Build and push — RAPIDAPI_KEY injected as build arg, never in image
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            REACT_APP_RAPIDAPI_KEY=${{ secrets.RAPIDAPI_KEY }}
+          cache-from: type=gha      # GitHub Actions cache — speeds up rebuilds
+          cache-to: type=gha,mode=max
+          provenance: true          # SLSA provenance attestation
+          sbom: true                # Attach SBOM to image automatically
+
+# ─────────────────────────────────────────────────────────────
+# JOB 2: TRIVY CVE SCAN
+# Scans the built image for known vulnerabilities
+# Runs after build, blocks signing if CRITICAL found
+# ─────────────────────────────────────────────────────────────
+  trivy-scan:
+    name: Trivy vulnerability scan
+    runs-on: ubuntu-latest
+    needs: build-image
+
+    permissions:
+      contents: read
+      security-events: write    # upload results to GitHub Security tab
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy — scan image for CVEs
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+          format: sarif              # SARIF format uploads to GitHub Security tab
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH    # only flag CRITICAL and HIGH
+          exit-code: '1'             # exit 1 = fail the job if CVEs found
+          ignore-unfixed: true       # ignore CVEs with no available fix yet
+
+      # Upload results to GitHub Security → Code scanning tab
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()    # upload even if scan found issues (for visibility)
+        with:
+          sarif_file: trivy-results.sarif
+
+# ─────────────────────────────────────────────────────────────
+# JOB 3: COSIGN IMAGE SIGNING
+# Cryptographically signs the image digest using OIDC identity
+# Only runs if Trivy scan passed — clean image only
+# ─────────────────────────────────────────────────────────────
+  sign-image:
+    name: Sign image with Cosign
+    runs-on: ubuntu-latest
+    needs: [build-image, trivy-scan]
+    # Both build AND scan must pass before signing
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write    # required for keyless OIDC signing
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign the image digest (keyless)
+        env:
+          DIGEST: ${{ needs.build-image.outputs.image-digest }}
+          TAGS: ${{ needs.build-image.outputs.image-ref }}
+        run: |
+          echo "Signing image digest: ${DIGEST}"
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          # --yes = non-interactive mode
+          # Keyless = no private key to manage
+          # GitHub OIDC token proves this signature came from THIS
+          # specific workflow in THIS repo at THIS commit
+          # Signature stored in Sigstore transparency log (rekor.sigstore.dev)
+
+      - name: Verify the signature
+        env:
+          DIGEST: ${{ needs.build-image.outputs.image-digest }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/Ganeshkoppaka/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          echo "✅ Image signature verified successfully"
